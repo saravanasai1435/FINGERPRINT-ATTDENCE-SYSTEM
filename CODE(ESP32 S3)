@@ -1,0 +1,420 @@
+// Fingerprint Attendance - ESP32-S3 + R307 + 1.3" OLED + LED + Switch
+// Google Sheets register with IN/OUT, name shown on the OLED.
+//
+// Libraries: Adafruit Fingerprint Sensor Library, U8g2
+// Board: ESP32S3 Dev Module | USB CDC On Boot: Enabled
+//
+// WIRING (signals on the right header of ESP32-S3-DevKitC-1)
+//   GPIO1  -> OLED SDA          GPIO2  -> OLED SCL
+//   GPIO42 -> Switch -> GND     GPIO41 -> 220R -> LED -> GND
+//   GPIO40 -> R307 TX wire      GPIO39 -> R307 RX wire
+//   5V -> R307 red, 3V3 -> OLED VCC, GND common
+//
+// Needs Code_inout.gs deployed in Apps Script (replies "OK|IN|Name|HH:MM:SS").
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Adafruit_Fingerprint.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <time.h>
+#include <map>
+
+// ===================== CONFIG =====================
+const char* WIFI_SSID  = "WIFI_SSID";
+const char* WIFI_PASS  = "WIFI_PASS";
+const char* SCRIPT_URL = "GOOGLE_SHEETS_WEBAPP_URL";
+const char* SECRET     = "KEY";               // must match Code_inout.gs
+const long  GMT_OFFSET_SEC = 19800;            // IST (UTC+5:30)
+const int   ADMIN_ID   = 1;                    // first enrolled finger
+const uint32_t DUPLICATE_WINDOW_MS = 30000;    // ignore same ID within 30 s
+const uint32_t NAME_REFRESH_MS     = 300000;   // refresh names from Sheet every 5 min
+
+// ===================== PINS =====================
+#define FP_RX_PIN  40   // ESP RX <- R307 TX
+#define FP_TX_PIN  39   // ESP TX -> R307 RX
+#define LED_PIN    41
+#define SW_PIN     42
+#define OLED_SDA   1
+#define OLED_SCL   2
+
+// ===================== OBJECTS =====================
+// 1.3" OLED is usually SH1106. If garbled/shifted, use the SSD1306 line instead.
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+// U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+Adafruit_Fingerprint finger(&Serial1);
+
+// ===================== NAME CACHE (ID -> name) =====================
+std::map<int, String> names;
+
+String nameFor(int id) {
+  auto it = names.find(id);
+  return (it != names.end()) ? it->second : String("");
+}
+
+// ===================== OFFLINE QUEUE (RAM) =====================
+struct Rec { int id; time_t ts; };
+const int QUEUE_MAX = 50;
+Rec q[QUEUE_MAX];
+int qn = 0;
+
+// ===================== UI HELPERS =====================
+void show(const char* l1, const char* l2 = "", const char* l3 = "") {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  u8g2.drawStr(0, 14, l1);
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(0, 36, l2);
+  u8g2.drawStr(0, 54, l3);
+  u8g2.sendBuffer();
+}
+
+// Draw text on one line, shrinking the font (then truncating) so it fits 128 px
+void drawFit(const String& s, int y) {
+  const uint8_t* fonts[] = {u8g2_font_ncenB12_tr, u8g2_font_ncenB10_tr,
+                            u8g2_font_7x13B_tr, u8g2_font_6x12_tr};
+  String t = s;
+  for (const uint8_t* f : fonts) {
+    u8g2.setFont(f);
+    if (u8g2.getStrWidth(t.c_str()) <= 128) { u8g2.drawStr(0, y, t.c_str()); return; }
+  }
+  while (t.length() > 1 && u8g2.getStrWidth(t.c_str()) > 128) t.remove(t.length() - 1);
+  u8g2.drawStr(0, y, t.c_str());
+}
+
+// Result screen: title (CHECK IN / CHECK OUT), name only ("_" if no name), time/note
+void showResult(const char* title, const String& name, int id, const String& note) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB10_tr);
+  u8g2.drawStr(0, 14, title);
+  drawFit(name.length() ? name : String("_"), 40);
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(0, 60, note.c_str());
+  u8g2.sendBuffer();
+}
+
+void blinkLed(int n, int ms) {
+  for (int i = 0; i < n; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(ms);
+    digitalWrite(LED_PIN, LOW);  delay(ms);
+  }
+}
+
+// ===================== NETWORK =====================
+void wifiConnect(uint32_t timeoutMs) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(200);
+}
+
+// Sends one request. If 'reply' is given, it receives the response body.
+bool sendToSheet(const char* action, int id, time_t ts, String* reply = nullptr) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();   // skips cert check; fine for a prototype
+
+  HTTPClient http;
+  String url = String(SCRIPT_URL) + "?secret=" + SECRET +
+               "&action=" + action + "&id=" + id + "&ts=" + (long)ts;
+  if (!http.begin(client, url)) return false;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);   // Apps Script replies 302
+  http.setTimeout(10000);
+
+  int code = http.GET();
+  String body = http.getString();
+  http.end();
+  body.trim();
+
+  Serial.printf("[HTTP] %s id=%d -> %d %s\n", action, id, code, body.substring(0, 60).c_str());
+  if (reply) *reply = body;
+  return (code == 200 && body.startsWith("OK"));
+}
+
+// Reply format: OK|IN|Name|HH:MM:SS
+bool parseScanReply(const String& body, String& status, String& name, String& tm) {
+  int a = body.indexOf('|');
+  if (a < 0) return false;
+  int b = body.indexOf('|', a + 1);
+  if (b < 0) return false;
+  int c = body.indexOf('|', b + 1);
+  if (c < 0) return false;
+  status = body.substring(a + 1, b);
+  name   = body.substring(b + 1, c);
+  tm     = body.substring(c + 1);
+  return status == "IN" || status == "OUT";
+}
+
+// Download "id,name" lines from the Students tab
+void fetchNames() {
+  String body;
+  if (!sendToSheet("students", 0, 0, &body)) {
+    Serial.println("[NAMES] fetch failed (keeping old list)");
+    return;
+  }
+  names.clear();
+  int pos = body.indexOf('\n');                       // skip the "OK" line
+  while (pos >= 0 && pos < (int)body.length() - 1) {
+    int end = body.indexOf('\n', pos + 1);
+    if (end < 0) end = body.length();
+    String line = body.substring(pos + 1, end);
+    line.trim();
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      int id = line.substring(0, comma).toInt();
+      String nm = line.substring(comma + 1);
+      nm.trim();
+      if (id > 0 && nm.length()) names[id] = nm;
+    }
+    pos = end;
+  }
+  Serial.printf("[NAMES] %u names loaded\n", (unsigned)names.size());
+}
+
+void enqueue(int id, time_t ts) {
+  if (qn < QUEUE_MAX) q[qn++] = {id, ts};
+}
+
+void flushQueue() {
+  static uint32_t last = 0;
+  if (qn == 0 || millis() - last < 5000) return;
+  last = millis();
+  if (sendToSheet("scan", q[0].id, q[0].ts)) {
+    for (int i = 1; i < qn; i++) q[i - 1] = q[i];
+    qn--;
+  }
+}
+
+// ===================== FINGERPRINT HELPERS =====================
+// Returns ID (>0), -1 no finger, -2 no match, -3 bad image
+int scanFinger() {
+  if (finger.getImage() != FINGERPRINT_OK) return -1;
+  if (finger.image2Tz() != FINGERPRINT_OK) return -3;
+  if (finger.fingerFastSearch() == FINGERPRINT_OK) return finger.fingerID;
+  return -2;
+}
+
+int waitMatch(uint32_t timeoutMs) {
+  uint32_t t = millis();
+  while (millis() - t < timeoutMs) {
+    int r = scanFinger();
+    if (r > 0 || r == -2) return r;
+    delay(50);
+  }
+  return -1;
+}
+
+bool waitImage(uint8_t slot, uint32_t timeoutMs) {
+  uint32_t t = millis();
+  while (millis() - t < timeoutMs) {
+    if (finger.getImage() == FINGERPRINT_OK) return finger.image2Tz(slot) == FINGERPRINT_OK;
+    delay(50);
+  }
+  return false;
+}
+
+void waitRemove() {
+  uint32_t t = millis();
+  while (finger.getImage() != FINGERPRINT_NOFINGER && millis() - t < 5000) delay(50);
+}
+
+int nextFreeId() {
+  finger.getParameters();
+  for (int i = 1; i <= finger.capacity; i++)
+    if (finger.loadModel(i) != FINGERPRINT_OK) return i;
+  return -1;
+}
+
+// ===================== ENROLL =====================
+void enrollFlow() {
+  finger.getTemplateCount();
+
+  if (finger.templateCount > 0) {                 // admin gate
+    show("ADMIN", "Scan admin finger");
+    int id = waitMatch(10000);
+    if (id != ADMIN_ID) {
+      show("DENIED", "Not admin");
+      blinkLed(3, 150);
+      delay(1000);
+      return;
+    }
+    waitRemove();
+  } else {
+    show("FIRST USER", "This will be ADMIN");
+    delay(1500);
+  }
+
+  int newId = nextFreeId();
+  if (newId < 0) { show("MEMORY FULL"); delay(2000); return; }
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "New ID: %d", newId);
+
+  show("ENROLL", buf, "Place finger");
+  if (!waitImage(1, 15000)) { show("TIMEOUT"); delay(1500); return; }
+
+  if (finger.fingerFastSearch() == FINGERPRINT_OK) {      // duplicate check
+    char dup[24];
+    snprintf(dup, sizeof(dup), "Already ID %d", finger.fingerID);
+    show("DUPLICATE", dup);
+    blinkLed(3, 150);
+    delay(1500);
+    waitRemove();
+    return;
+  }
+
+  show("ENROLL", buf, "Remove finger");
+  delay(800);
+  waitRemove();
+
+  show("ENROLL", buf, "Place SAME again");
+  if (!waitImage(2, 15000)) { show("TIMEOUT"); delay(1500); return; }
+
+  if (finger.createModel() != FINGERPRINT_OK) {
+    show("FAILED", "Fingers differ");
+    blinkLed(3, 150); delay(1500); return;
+  }
+  if (finger.storeModel(newId) != FINGERPRINT_OK) {
+    show("FAILED", "Store error");
+    blinkLed(3, 150); delay(1500); return;
+  }
+
+  bool ok = sendToSheet("enroll", newId, time(nullptr));
+  show("ENROLLED", buf, ok ? "Type name in Sheet" : "Sheet offline");
+  blinkLed(2, 300);
+  waitRemove();
+  delay(1500);
+}
+
+// ===================== SWITCH =====================
+bool switchPressed() {
+  static bool prev = HIGH;
+  static uint32_t lastChange = 0;
+  bool cur = digitalRead(SW_PIN);
+  if (cur != prev && millis() - lastChange > 50) {
+    lastChange = millis();
+    prev = cur;
+    if (cur == LOW) return true;
+  }
+  return false;
+}
+
+// ===================== ATTENDANCE =====================
+void markAttendance(int id) {
+  time_t now = time(nullptr);
+  String cachedName = nameFor(id);
+
+  // Show who it is immediately (from the name cache) while the Sheet is updated
+  showResult("WELCOME", cachedName, id, "Saving...");
+  digitalWrite(LED_PIN, HIGH);
+
+  String body, status, name, tm;
+  bool ok = sendToSheet("scan", id, now, &body);
+  digitalWrite(LED_PIN, LOW);
+
+  if (ok && parseScanReply(body, status, name, tm)) {
+    if (name.length()) names[id] = name;           // keep cache fresh
+    showResult(status == "IN" ? "CHECK IN" : "CHECK OUT", name, id, tm);
+    blinkLed(status == "IN" ? 1 : 2, 250);
+  } else {
+    enqueue(id, now);                              // offline or Sheet error
+    showResult("SAVED", cachedName, id, "Queued (offline)");
+    blinkLed(3, 120);
+  }
+  delay(2000);
+}
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(SW_PIN, INPUT_PULLUP);
+
+  Wire.setPins(OLED_SDA, OLED_SCL);   // must be before u8g2.begin()
+  u8g2.begin();
+  show("ATTENDANCE", "Starting...");
+
+  Serial1.begin(57600, SERIAL_8N1, FP_RX_PIN, FP_TX_PIN);
+  finger.begin(57600);
+  if (!finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor NOT found - swap TX/RX wires");
+    show("ERROR", "Sensor not found", "Swap TX/RX wires");
+    while (true) blinkLed(1, 500);
+  }
+  Serial.println("Fingerprint sensor OK");
+
+  show("ATTENDANCE", "Connecting WiFi...");
+  wifiConnect(15000);
+  Serial.println(WiFi.status() == WL_CONNECTED ? "WiFi connected" : "WiFi FAILED");
+
+  configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+  struct tm tmInfo;
+  getLocalTime(&tmInfo, 8000);
+
+  show("ATTENDANCE", "Loading names...");
+  fetchNames();
+
+  finger.getTemplateCount();
+  char buf[24];
+  snprintf(buf, sizeof(buf), "Enrolled: %d", finger.templateCount);
+  show("READY", WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi OFFLINE", buf);
+  delay(1500);
+}
+
+// ===================== LOOP =====================
+void loop() {
+  static uint32_t lastDraw = 0, lastWifiTry = 0, lastScanTime = 0, lastNames = 0;
+  static int lastId = -1;
+
+  // WiFi auto-reconnect
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiTry > 20000) {
+    lastWifiTry = millis();
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+
+  if (switchPressed()) { enrollFlow(); lastDraw = 0; return; }
+
+  flushQueue();
+
+  // Periodic name refresh (picks up names typed into the Students tab)
+  if (WiFi.status() == WL_CONNECTED && millis() - lastNames > NAME_REFRESH_MS) {
+    lastNames = millis();
+    fetchNames();
+  }
+
+  int r = scanFinger();
+  if (r > 0) {
+    if (r == lastId && millis() - lastScanTime < DUPLICATE_WINDOW_MS) {
+      showResult("ALREADY", nameFor(r), r, "Wait a moment");
+      blinkLed(2, 100);
+      delay(1000);
+    } else {
+      lastId = r;
+      lastScanTime = millis();
+      markAttendance(r);
+    }
+    waitRemove();
+    lastDraw = 0;
+  } else if (r == -2) {
+    show("NOT FOUND", "Try again");
+    blinkLed(3, 120);
+    waitRemove();
+    lastDraw = 0;
+  }
+
+  // Idle screen: clock + queue count
+  if (millis() - lastDraw > 1000) {
+    lastDraw = millis();
+    struct tm t;
+    char l2[24] = "--:--:--";
+    char l3[24];
+    if (getLocalTime(&t, 0)) strftime(l2, sizeof(l2), "%H:%M:%S  %d/%m", &t);
+    snprintf(l3, sizeof(l3), "Pending: %d", qn);
+    show("PLACE FINGER", l2, l3);
+  }
+}
