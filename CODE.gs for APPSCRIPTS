@@ -1,0 +1,195 @@
+// Fingerprint Attendance - Apps Script backend (IN/OUT register version)
+//
+// Tabs (created automatically):
+//   Register : Date | ID | Name | In Time | Out Time | Hours     (one row per person per day)
+//   Log      : Date | Time | ID | Name | Event                   (every accepted scan)
+//   Students : ID | Name                                         (type names here)
+//
+// Rule: first scan of the day = IN. Next scan (after MIN_GAP_SEC) = OUT.
+// Any later scan the same day updates the OUT time to the latest one.
+//
+// Deploy: Deploy > Manage deployments > Edit > New version (access: Anyone)
+// Test:   <your /exec URL>?secret=1756&action=scan&id=1  -> OK|IN|Name|HH:MM:SS
+
+const SECRET      = 'KEY';          // must match SECRET in the ESP32 sketch
+const TZ          = 'Asia/Kolkata';
+const SHEET_ID    = '';              // leave empty if the script is bound to the Sheet
+const MIN_GAP_SEC = 60;              // scans closer than this to the last one are ignored
+
+const REG_SHEET = 'Register';
+const LOG_SHEET = 'Log';
+const STU_SHEET = 'Students';
+
+function doGet(e) {
+  const p = (e && e.parameter) ? e.parameter : {};
+  if (p.secret !== SECRET) return out('DENIED');
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) return out('BUSY');
+
+  try {
+    const ss = SHEET_ID ? SpreadsheetApp.openById(SHEET_ID)
+                        : SpreadsheetApp.getActiveSpreadsheet();
+    const stu = getSheet_(ss, STU_SHEET, ['ID', 'Name']);
+
+    switch (p.action) {
+      case 'ping':
+        return out('OK');
+
+      case 'students':
+        return out('OK\n' + studentsList_(stu));
+
+      case 'enroll': {
+        const id = String(p.id || '').trim();
+        if (!id) return out('BAD_ID');
+        if (findName_(stu, id) === null) stu.appendRow([id, '']);
+        return out('OK');
+      }
+
+      case 'scan':
+        return out(handleScan_(ss, stu, p));
+
+      default:
+        return out('BAD_ACTION');
+    }
+  } catch (err) {
+    return out('ERROR: ' + err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------- scan handling ----------
+
+function handleScan_(ss, stu, p) {
+  const id = String(p.id || '').trim();
+  if (!id) return 'BAD_ID';
+
+  const ts = Number(p.ts);
+  const when = ts > 100000 ? new Date(ts * 1000) : new Date();
+  const dateStr = Utilities.formatDate(when, TZ, 'yyyy-MM-dd');
+  const timeStr = Utilities.formatDate(when, TZ, 'HH:mm:ss');
+  const name = clean_(findName_(stu, id) || '');
+
+  const reg = getRegister_(ss);
+  const log = getLog_(ss);
+  const row = findRow_(reg, dateStr, id);
+
+  // First scan of the day -> IN
+  if (!row) {
+    appendFormatted_(reg, ['@', '0', '@', '@', '@', '@'], [dateStr, id, name, timeStr, '', '']);
+    appendFormatted_(log, ['@', '@', '0', '@', '@'], [dateStr, timeStr, id, name, 'IN']);
+    return reply_('IN', name, timeStr);
+  }
+
+  const inT  = String(row.vals[3]);
+  const outT = String(row.vals[4]);
+  const lastS = toSec_(outT || inT);
+  const nowS  = toSec_(timeStr);
+
+  // Too soon after the previous scan -> ignore (accidental double scan)
+  if (nowS - lastS < MIN_GAP_SEC) {
+    return reply_(outT ? 'OUT' : 'IN', name, outT || inT);
+  }
+
+  // Otherwise -> OUT (or update OUT to the latest scan)
+  reg.getRange(row.row, 5, 1, 2).setNumberFormats([['@', '@']])
+     .setValues([[timeStr, hours_(inT, timeStr)]]);
+  if (name && !String(row.vals[2])) reg.getRange(row.row, 3).setValue(name);
+  appendFormatted_(log, ['@', '@', '0', '@', '@'], [dateStr, timeStr, id, name, 'OUT']);
+  return reply_('OUT', name, timeStr);
+}
+
+function reply_(status, name, timeStr) {
+  return 'OK|' + status + '|' + name + '|' + timeStr;
+}
+
+// ---------- sheets ----------
+
+function getSheet_(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(headers);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  }
+  return sh;
+}
+
+function getRegister_(ss) {
+  return getSheet_(ss, REG_SHEET, ['Date', 'ID', 'Name', 'In Time', 'Out Time', 'Hours']);
+}
+
+function getLog_(ss) {
+  return getSheet_(ss, LOG_SHEET, ['Date', 'Time', 'ID', 'Name', 'Event']);
+}
+
+function appendFormatted_(sh, formats, values) {
+  const r = sh.getLastRow() + 1;
+  sh.getRange(r, 1, 1, values.length).setNumberFormats([formats]).setValues([values]);
+}
+
+// Looks at the last 500 rows for today's row of this ID
+function findRow_(reg, dateStr, id) {
+  const last = reg.getLastRow();
+  if (last < 2) return null;
+  const start = Math.max(2, last - 499);
+  const vals = reg.getRange(start, 1, last - start + 1, 6).getValues();
+  for (let i = vals.length - 1; i >= 0; i--) {
+    const d = vals[i][0] instanceof Date
+      ? Utilities.formatDate(vals[i][0], TZ, 'yyyy-MM-dd')
+      : String(vals[i][0]);
+    if (d === dateStr && String(vals[i][1]) === id) return { row: start + i, vals: vals[i] };
+  }
+  return null;
+}
+
+// Name for an ID ('' if listed without a name), or null if the ID is not listed
+function findName_(stu, id) {
+  const last = stu.getLastRow();
+  if (last < 2) return null;
+  const rows = stu.getRange(2, 1, last - 1, 2).getValues();
+  for (let i = 0; i < rows.length; i++) {
+    if (String(rows[i][0]).trim() === id) return String(rows[i][1] || '');
+  }
+  return null;
+}
+
+// "id,name" per line, only for rows that have a name (used by the ESP32 name cache)
+function studentsList_(stu) {
+  const last = stu.getLastRow();
+  if (last < 2) return '';
+  const rows = stu.getRange(2, 1, last - 1, 2).getValues();
+  const lines = [];
+  for (let i = 0; i < rows.length; i++) {
+    const id = String(rows[i][0]).trim();
+    const nm = clean_(rows[i][1]);
+    if (id && nm) lines.push(id + ',' + nm);
+  }
+  return lines.join('\n');
+}
+
+// ---------- utils ----------
+
+function out(text) {
+  return ContentService.createTextOutput(text);
+}
+
+function clean_(s) {
+  return String(s || '').replace(/[|,\r\n]/g, ' ').trim();
+}
+
+function toSec_(t) {
+  const a = String(t).split(':');
+  const s = (+a[0]) * 3600 + (+a[1]) * 60 + (+a[2] || 0);
+  return isNaN(s) ? 0 : s;
+}
+
+function hours_(inT, outT) {
+  let d = toSec_(outT) - toSec_(inT);
+  if (d < 0) d = 0;
+  const h = Math.floor(d / 3600);
+  const m = Math.floor((d % 3600) / 60);
+  return h + ':' + ('0' + m).slice(-2);
+}
